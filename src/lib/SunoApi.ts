@@ -627,7 +627,9 @@ class SunoApi {
     if (response.status !== 200) {
       throw new Error('Error response:' + response.statusText);
     }
-    const songIds = response.data.clips.map((audio: any) => audio.id);
+    // 过滤试听版(preview):免费账号的 v5.5(fenix)为 60s 试听,无完整音频,只保留完整版(gen)
+    const fullClips = response.data.clips.filter((audio: any) => audio.metadata?.type !== 'preview');
+    const songIds = fullClips.map((audio: any) => audio.id);
     //Want to wait for music file generation
     if (wait_audio) {
       const startTime = Date.now();
@@ -648,7 +650,7 @@ class SunoApi {
       }
       return lastResponse;
     } else {
-      return response.data.clips.map((audio: any) => ({
+      return fullClips.map((audio: any) => ({
         id: audio.id,
         title: audio.title,
         image_url: audio.image_url,
