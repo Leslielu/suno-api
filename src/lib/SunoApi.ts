@@ -573,7 +573,7 @@ class SunoApi {
         web_client_pathname: '/create',
         is_max_mode: false,
         create_mode: isCustom ? 'custom' : 'description',
-        user_tier: '4497580c-f4eb-4f86-9f0e-960eb7c48d7d', // 账号订阅 tier(网页端固定值)
+        user_tier: '4497580c-f4eb-4f86-9f0e-960eb7c48d7d', // 固定免费 tier;混合付费账号时需从 billing 响应动态读取 tier 替换此值
         create_session_token: randomUUID(),
         disable_volume_normalization: false
       },
@@ -894,3 +894,122 @@ export const sunoApi = async (cookie?: string) => {
 
   return instance;
 };
+
+// ===================== 多账号轮询 + 余额感知 =====================
+
+/** 所有账号都不可用(无积分或全部失败)时抛出,路由层映射为 503 */
+export class AllAccountsExhausted extends Error {
+  constructor(message: string, public override cause?: unknown) {
+    super(message);
+    this.name = 'AllAccountsExhausted';
+  }
+}
+
+/** 解析多 cookie:`SUNO_COOKIES`(||| 分隔)优先,否则 fallback `SUNO_COOKIE`(单个) */
+function parseCookiesEnv(): string[] {
+  const multi = process.env.SUNO_COOKIES;
+  if (multi && multi.trim()) {
+    return multi
+      .split('|||')
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0 && s.includes('__client'));
+  }
+  const single = process.env.SUNO_COOKIE;
+  return single && single.includes('__client') ? [single] : [];
+}
+
+/** 账号池:round-robin 轮询 + 余额感知(复用上面的 sunoApi(cookie) 实例缓存) */
+class SunoApiPool {
+  private cookies: string[] = parseCookiesEnv();
+  private cursor = 0;
+  private ttlMs = 60_000; // 余额缓存 60s
+  private creditsCache = new Map<string, { left: number; expiresAt: number }>();
+  private inflight = new Map<string, Promise<number>>(); // 并发查余额去重
+
+  /** 选一个有积分的账号,返回已 init 的 SunoApi 实例 + 其 cookie */
+  async acquire(): Promise<{ api: SunoApi; cookie: string }> {
+    if (this.cookies.length === 0) {
+      throw new AllAccountsExhausted(
+        'No accounts configured. Set SUNO_COOKIES or SUNO_COOKIE in .env.'
+      );
+    }
+    const n = this.cookies.length;
+    let lastErr: unknown;
+    for (let i = 0; i < n; i++) {
+      const idx = (this.cursor + i) % n;
+      const cookie = this.cookies[idx];
+      try {
+        const left = await this.getCredits(cookie);
+        if (left > 0) {
+          this.cursor = (idx + 1) % n; // 推进游标,实现轮流
+          logger.info({ account: idx, credits_left: left }, 'pool: acquire account');
+          return { api: await sunoApi(cookie), cookie };
+        }
+        logger.info({ account: idx, credits_left: left }, 'pool: skip (no credits)');
+      } catch (e) {
+        lastErr = e;
+        this.creditsCache.delete(cookie);
+        logger.warn({ account: idx, err: (e as Error).message }, 'pool: credit check failed, skip');
+      }
+    }
+    throw new AllAccountsExhausted('All accounts exhausted (no credits or all failed).', lastErr);
+  }
+
+  /** 查某账号余额,TTL 缓存 + 并发去重 */
+  private async getCredits(cookie: string): Promise<number> {
+    const cached = this.creditsCache.get(cookie);
+    if (cached && cached.expiresAt > Date.now()) {
+      return cached.left;
+    }
+    let p = this.inflight.get(cookie);
+    if (!p) {
+      p = (async () => {
+        try {
+          const api = await sunoApi(cookie);
+          const info = (await api.get_credits()) as { credits_left: number };
+          this.creditsCache.set(cookie, {
+            left: info.credits_left,
+            expiresAt: Date.now() + this.ttlMs,
+          });
+          return info.credits_left;
+        } finally {
+          this.inflight.delete(cookie);
+        }
+      })();
+      this.inflight.set(cookie, p);
+    }
+    return p;
+  }
+
+  /** 生成成功后扣减缓存(默认每次生成约 10 credits / 2 首) */
+  noteConsumption(cookie: string, cost: number = 10): void {
+    const cached = this.creditsCache.get(cookie);
+    if (cached) {
+      cached.left = Math.max(0, cached.left - cost);
+    }
+  }
+
+  /** 生成时实际 402 等情况,强制刷新某账号余额 */
+  invalidate(cookie: string): void {
+    this.creditsCache.delete(cookie);
+  }
+}
+
+// 全局单例(跨 hot-reload 复用)
+const globalForPool = global as unknown as { __sunoPool?: SunoApiPool };
+export const pool: SunoApiPool = globalForPool.__sunoPool ?? (globalForPool.__sunoPool = new SunoApiPool());
+
+/** 路由统一入口:请求带有效 Cookie → 用请求的(覆盖);否则走池 */
+export async function sunoApiFromRequest(cookieHeader?: string): Promise<{ api: SunoApi; cookie: string; pooled: boolean }> {
+  if (cookieHeader && cookieHeader.includes('__client')) {
+    return { api: await sunoApi(cookieHeader), cookie: cookieHeader, pooled: false };
+  }
+  const { api, cookie } = await pool.acquire();
+  return { api, cookie, pooled: true };
+}
+
+/** 直接走池(无请求 cookie 的入口,如 /v1/chat/completions) */
+export async function sunoApiPooled(): Promise<{ api: SunoApi; cookie: string; pooled: boolean }> {
+  const { api, cookie } = await pool.acquire();
+  return { api, cookie, pooled: true };
+}

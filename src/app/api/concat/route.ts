@@ -1,6 +1,6 @@
 import { NextResponse, NextRequest } from "next/server";
 import { cookies } from 'next/headers'
-import { sunoApi } from "@/lib/SunoApi";
+import { sunoApi, sunoApiFromRequest, pool, AllAccountsExhausted } from "@/lib/SunoApi";
 import { corsHeaders } from "@/lib/utils";
 
 export const dynamic = "force-dynamic";
@@ -19,7 +19,9 @@ export async function POST(req: NextRequest) {
           }
         });
       }
-      const audioInfo = await (await sunoApi((await cookies()).toString())).concatenate(clip_id);
+      const { api, cookie, pooled } = await sunoApiFromRequest((await cookies()).toString());
+      const audioInfo = await api.concatenate(clip_id);
+      if (pooled) pool.noteConsumption(cookie);
       return new NextResponse(JSON.stringify(audioInfo), {
         status: 200,
         headers: {
@@ -29,7 +31,13 @@ export async function POST(req: NextRequest) {
       });
     } catch (error: any) {
       console.error('Error generating concatenating audio:', error);
-      
+      if (error instanceof AllAccountsExhausted) {
+        return new NextResponse(JSON.stringify({ error: 'All accounts have no credits left' }), {
+          status: 503,
+          headers: { 'Content-Type': 'application/json', ...corsHeaders }
+        });
+      }
+
       // Handle different types of errors
       if (error.response) {
         // Axios error with response

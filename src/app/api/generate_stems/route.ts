@@ -1,6 +1,6 @@
 import { NextResponse, NextRequest } from "next/server";
 import { cookies } from 'next/headers';
-import { DEFAULT_MODEL, sunoApi } from "@/lib/SunoApi";
+import { DEFAULT_MODEL, sunoApi, sunoApiFromRequest, pool, AllAccountsExhausted } from "@/lib/SunoApi";
 import { corsHeaders } from "@/lib/utils";
 
 export const dynamic = "force-dynamic";
@@ -21,8 +21,9 @@ export async function POST(req: NextRequest) {
         });
       }
 
-      const audioInfo = await (await sunoApi((await cookies()).toString()))
-        .generateStems(audio_id);
+      const { api, cookie, pooled } = await sunoApiFromRequest((await cookies()).toString());
+      const audioInfo = await api.generateStems(audio_id);
+      if (pooled) pool.noteConsumption(cookie);
 
       return new NextResponse(JSON.stringify(audioInfo), {
         status: 200,
@@ -33,7 +34,13 @@ export async function POST(req: NextRequest) {
       });
     } catch (error: any) {
       console.error('Error generating stems:', error);
-      
+      if (error instanceof AllAccountsExhausted) {
+        return new NextResponse(JSON.stringify({ error: 'All accounts have no credits left' }), {
+          status: 503,
+          headers: { 'Content-Type': 'application/json', ...corsHeaders }
+        });
+      }
+
       // Handle different types of errors
       if (error.response) {
         // Axios error with response
