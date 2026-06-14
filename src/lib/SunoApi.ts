@@ -18,7 +18,7 @@ const cache = globalForSunoApi.sunoApiCache || new Map<string, SunoApi>();
 globalForSunoApi.sunoApiCache = cache;
 
 const logger = pino();
-export const DEFAULT_MODEL = 'chirp-v3-5';
+export const DEFAULT_MODEL = 'chirp-auk-turbo';
 
 export interface AudioInfo {
   id: string; // Unique identifier for the audio
@@ -90,12 +90,12 @@ class SunoApi {
       withCredentials: true,
       headers: {
         'Affiliate-Id': 'undefined',
-        'Device-Id': `"${this.deviceId}"`,
-        'x-suno-client': 'Android prerelease-4nt180t 1.0.42',
-        'X-Requested-With': 'com.suno.android',
-        'sec-ch-ua': '"Chromium";v="130", "Android WebView";v="130", "Not?A_Brand";v="99"',
-        'sec-ch-ua-mobile': '?1',
-        'sec-ch-ua-platform': '"Android"',
+        'device-id': this.deviceId,
+        'sec-ch-ua': '"Google Chrome";v="149", "Chromium";v="149", "Not)A;Brand";v="24"',
+        'sec-ch-ua-mobile': '?0',
+        'sec-ch-ua-platform': '"macOS"',
+        'referring-origin': 'https://suno.com',
+        'referer': 'https://suno.com/',
         'User-Agent': this.userAgent
       }
     });
@@ -558,22 +558,41 @@ class SunoApi {
     continue_at?: number
   ): Promise<AudioInfo[]> {
     await this.keepAlive();
+    // 模拟 suno.com 网页端的 generate/v2-web 请求结构
     const payload: any = {
-      make_instrumental: make_instrumental,
-      mv: model || DEFAULT_MODEL,
-      prompt: '',
+      token: null,
       generation_type: 'TEXT',
-      continue_at: continue_at,
+      title: isCustom ? (title || '') : '',
+      tags: isCustom ? (tags || '') : '',
+      negative_tags: isCustom ? (negative_tags || '') : '',
+      mv: model || DEFAULT_MODEL,
+      prompt: isCustom ? prompt : '',
+      make_instrumental: make_instrumental,
+      user_uploaded_images_b64: null,
+      metadata: {
+        web_client_pathname: '/create',
+        is_max_mode: false,
+        create_mode: isCustom ? 'custom' : 'description',
+        user_tier: '4497580c-f4eb-4f86-9f0e-960eb7c48d7d', // 账号订阅 tier(网页端固定值)
+        create_session_token: randomUUID(),
+        disable_volume_normalization: false
+      },
+      override_fields: [],
+      cover_clip_id: null,
+      cover_start_s: null,
+      cover_end_s: null,
+      persona_id: null,
+      artist_clip_id: null,
+      artist_start_s: null,
+      artist_end_s: null,
       continue_clip_id: continue_clip_id,
+      continued_aligned_prompt: null,
+      continue_at: continue_at,
       task: task,
-      token: await this.getCaptcha()
+      transaction_uuid: randomUUID(),
+      token_provider: null
     };
-    if (isCustom) {
-      payload.tags = tags;
-      payload.title = title;
-      payload.negative_tags = negative_tags;
-      payload.prompt = prompt;
-    } else {
+    if (!isCustom) {
       payload.gpt_description_prompt = prompt;
     }
     logger.info(
@@ -594,10 +613,15 @@ class SunoApi {
         )
     );
     const response = await this.client.post(
-      `${SunoApi.BASE_URL}/api/generate/v2/`,
+      `${SunoApi.BASE_URL}/api/generate/v2-web/`,
       payload,
       {
-        timeout: 10000 // 10 seconds timeout
+        timeout: 30000,
+        headers: {
+          // 网页端特有的 browser-token,内容仅为当前毫秒时间戳的 base64
+          'browser-token': JSON.stringify({ token: Buffer.from(JSON.stringify({ timestamp: Date.now() })).toString('base64') }),
+          'referring-pathname': '/'
+        }
       }
     );
     if (response.status !== 200) {
