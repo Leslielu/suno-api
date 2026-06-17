@@ -273,10 +273,15 @@ class SunoApi {
       args.push('--enable-unsafe-swiftshader',
         '--disable-gpu',
         '--disable-setuid-sandbox');
-    const browser = await this.getBrowserType().launch({
+    const launchOpts: any = {
       args,
-      headless: yn(process.env.BROWSER_HEADLESS, { default: true })
-    });
+      headless: yn(process.env.BROWSER_HEADLESS, { default: true }),
+    };
+    // 国内服务器直连 suno 不稳,通过 HTTPS_PROXY 让解题浏览器也走代理(与 axios 一致)
+    if (process.env.HTTPS_PROXY) {
+      launchOpts.proxy = { server: process.env.HTTPS_PROXY };
+    }
+    const browser = await this.getBrowserType().launch(launchOpts);
     const context = await browser.newContext({ userAgent: this.userAgent, locale: process.env.BROWSER_LOCALE, viewport: null });
     const cookies = [];
     const lax: 'Lax' | 'Strict' | 'None' = 'Lax';
@@ -311,7 +316,7 @@ class SunoApi {
     logger.info('CAPTCHA required. Launching browser...')
     const browser = await this.launchBrowser();
     const page = await browser.newPage();
-    await page.goto('https://suno.com/create', { referer: 'https://www.google.com/', waitUntil: 'domcontentloaded', timeout: 0 });
+    await page.goto('https://suno.com/create', { referer: 'https://www.google.com/', waitUntil: 'domcontentloaded', timeout: 30000 });
 
     logger.info('Waiting for Suno interface to load');
     // await page.locator('.react-aria-GridList').waitFor({ timeout: 60000 });
