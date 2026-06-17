@@ -558,9 +558,19 @@ class SunoApi {
     continue_at?: number
   ): Promise<AudioInfo[]> {
     await this.keepAlive();
+    // Suno 风控触发时要求 generate 带 hCaptcha token,否则返回 422 token_validation_failed。
+    // 接入已有的 captchaRequired() + getCaptcha()(2captcha 解题),与网页端行为一致。
+    let captchaToken: string | null = null;
+    if (await this.captchaRequired()) {
+      logger.info('Generation requires CAPTCHA. Solving via 2captcha...');
+      captchaToken = await this.getCaptcha();
+      if (!captchaToken) {
+        throw new Error('CAPTCHA required but 2captcha returned no token');
+      }
+    }
     // 模拟 suno.com 网页端的 generate/v2-web 请求结构
     const payload: any = {
-      token: null,
+      token: captchaToken,
       generation_type: 'TEXT',
       title: isCustom ? (title || '') : '',
       tags: isCustom ? (tags || '') : '',
@@ -590,7 +600,7 @@ class SunoApi {
       continue_at: continue_at,
       task: task,
       transaction_uuid: randomUUID(),
-      token_provider: null
+      token_provider: captchaToken ? 1 : null
     };
     if (!isCustom) {
       payload.gpt_description_prompt = prompt;
