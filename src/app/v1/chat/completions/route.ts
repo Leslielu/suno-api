@@ -1,6 +1,7 @@
 import { NextResponse, NextRequest } from "next/server";
 import { DEFAULT_MODEL, sunoApi, sunoApiPooled, pool, AllAccountsExhausted } from "@/lib/SunoApi";
 import { corsHeaders } from "@/lib/utils";
+import { withRequestLog } from "@/lib/requestLog";
 
 export const dynamic = "force-dynamic";
 
@@ -8,7 +9,7 @@ export const dynamic = "force-dynamic";
  * desc
  *
  */
-export async function POST(req: NextRequest) {
+async function handle(req: NextRequest) {
   try {
 
     const body = await req.json();
@@ -60,6 +61,8 @@ export async function POST(req: NextRequest) {
     });
   }
 }
+
+export const POST = withRequestLog('chat_completions', handle);
 
 export async function OPTIONS(request: Request) {
   return new Response(null, {

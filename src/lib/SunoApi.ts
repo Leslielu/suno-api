@@ -1,16 +1,11 @@
 import axios, { AxiosInstance } from 'axios';
 import UserAgent from 'user-agents';
 import pino from 'pino';
-import yn from 'yn';
-import { isPage, sleep, waitForRequests } from '@/lib/utils';
+import { sleep } from '@/lib/utils';
+import { accountTag, dumpHttpFailure } from '@/lib/diagnostics';
 import * as cookie from 'cookie';
 import { randomUUID } from 'node:crypto';
 import { Solver } from '@2captcha/captcha-solver';
-import { paramsCoordinates } from '@2captcha/captcha-solver/dist/structs/2captcha';
-import { BrowserContext, Page, Locator, chromium, firefox } from 'rebrowser-playwright-core';
-import { createCursor, Cursor } from 'ghost-cursor-playwright';
-import { promises as fs } from 'fs';
-import path from 'node:path';
 
 // sunoApi instance caching
 const globalForSunoApi = global as unknown as { sunoApiCache?: Map<string, SunoApi> };
@@ -79,8 +74,6 @@ class SunoApi {
   private userAgent?: string;
   private cookies: Record<string, string | undefined>;
   private solver = new Solver(process.env.TWOCAPTCHA_KEY + '');
-  private ghostCursorEnabled = yn(process.env.BROWSER_GHOST_CURSOR, { default: false });
-  private cursor?: Cursor;
 
   constructor(cookies: string) {
     this.userAgent = new UserAgent(/Macintosh/).random().toString(); // Usually Mac systems get less amount of CAPTCHAs
@@ -212,100 +205,6 @@ class SunoApi {
   }
 
   /**
-   * Clicks on a locator or XY vector. This method is made because of the difference between ghost-cursor-playwright and Playwright methods
-   */
-  private async click(target: Locator|Page, position?: { x: number, y: number }): Promise<void> {
-    if (this.ghostCursorEnabled) {
-      let pos: any = isPage(target) ? { x: 0, y: 0 } : await target.boundingBox();
-      if (position) 
-        pos = {
-          ...pos,
-          x: pos.x + position.x,
-          y: pos.y + position.y,
-          width: null,
-          height: null,
-        };
-      return this.cursor?.actions.click({
-        target: pos
-      });
-    } else {
-      if (isPage(target))
-        return target.mouse.click(position?.x ?? 0, position?.y ?? 0);
-      else
-        return target.click({ force: true, position });
-    }
-  }
-
-  /**
-   * Get the BrowserType from the `BROWSER` environment variable.
-   * @returns {BrowserType} chromium, firefox or webkit. Default is chromium
-   */
-  private getBrowserType() {
-    const browser = process.env.BROWSER?.toLowerCase();
-    switch (browser) {
-      case 'firefox':
-        return firefox;
-      /*case 'webkit': ** doesn't work with rebrowser-patches
-      case 'safari':
-        return webkit;*/
-      default:
-        return chromium;
-    }
-  }
-
-  /**
-   * Launches a browser with the necessary cookies
-   * @returns {BrowserContext}
-   */
-  private async launchBrowser(): Promise<BrowserContext> {
-    const args = [
-      '--disable-blink-features=AutomationControlled',
-      '--disable-web-security',
-      '--no-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-features=site-per-process',
-      '--disable-features=IsolateOrigins',
-      '--disable-extensions',
-      '--disable-infobars'
-    ];
-    // Check for GPU acceleration, as it is recommended to turn it off for Docker
-    if (yn(process.env.BROWSER_DISABLE_GPU, { default: false }))
-      args.push('--enable-unsafe-swiftshader',
-        '--disable-gpu',
-        '--disable-setuid-sandbox');
-    const launchOpts: any = {
-      args,
-      headless: yn(process.env.BROWSER_HEADLESS, { default: true }),
-    };
-    // 国内服务器直连 suno 不稳,通过 HTTPS_PROXY 让解题浏览器也走代理(与 axios 一致)
-    if (process.env.HTTPS_PROXY) {
-      launchOpts.proxy = { server: process.env.HTTPS_PROXY };
-    }
-    const browser = await this.getBrowserType().launch(launchOpts);
-    const context = await browser.newContext({ userAgent: this.userAgent, locale: process.env.BROWSER_LOCALE, viewport: null });
-    const cookies = [];
-    const lax: 'Lax' | 'Strict' | 'None' = 'Lax';
-    cookies.push({
-      name: '__session',
-      value: this.currentToken+'',
-      domain: '.suno.com',
-      path: '/',
-      sameSite: lax
-    });
-    for (const key in this.cookies) {
-      cookies.push({
-        name: key,
-        value: this.cookies[key]+'',
-        domain: '.suno.com',
-        path: '/',
-        sameSite: lax
-      })
-    }
-    await context.addCookies(cookies);
-    return context;
-  }
-
-  /**
    * Checks for CAPTCHA verification and solves the CAPTCHA if needed
    * @returns {string|null} hCaptcha token. If no verification is required, returns null
    */
@@ -313,134 +212,23 @@ class SunoApi {
     if (!await this.captchaRequired())
       return null;
 
-    logger.info('CAPTCHA required. Launching browser...')
-    const browser = await this.launchBrowser();
-    const page = await browser.newPage();
-    await page.goto('https://suno.com/create', { referer: 'https://www.google.com/', waitUntil: 'domcontentloaded', timeout: 30000 });
-
-    logger.info('Waiting for Suno interface to load');
-    // await page.locator('.react-aria-GridList').waitFor({ timeout: 60000 });
-    await page.waitForResponse('**/api/project/**\\?**', { timeout: 60000 }); // wait for song list API call
-
-    if (this.ghostCursorEnabled)
-      this.cursor = await createCursor(page);
-    
-    logger.info('Triggering the CAPTCHA');
+    // Suno 用 hCaptcha(sitekey 见 create 页 challenge iframe 的 src)。直接用 2captcha 的
+    // hcaptcha 接口(token-based:pageurl + sitekey → token)拿 token,不再用浏览器 + coordinates
+    // 解题(coordinates 解"比X更重"这类逻辑题既慢又准,远超 60s 有效期)。
+    logger.info('Solving hCaptcha via 2captcha (token-based)...');
     try {
-      await page.getByLabel('Close').click({ timeout: 2000 }); // close all popups
-      // await this.click(page, { x: 318, y: 13 });
-    } catch(e) {}
-
-    const textarea = page.locator('.custom-textarea');
-    await this.click(textarea);
-    await textarea.pressSequentially('Lorem ipsum', { delay: 80 });
-
-    const button = page.locator('button[aria-label="Create"]').locator('div.flex');
-    this.click(button);
-
-    const controller = new AbortController();
-    new Promise<void>(async (resolve, reject) => {
-      const frame = page.frameLocator('iframe[title*="hCaptcha"]');
-      const challenge = frame.locator('.challenge-container');
-      try {
-        let wait = true;
-        while (true) {
-          if (wait)
-            await waitForRequests(page, controller.signal);
-          const drag = (await challenge.locator('.prompt-text').first().innerText()).toLowerCase().includes('drag');
-          let captcha: any;
-          for (let j = 0; j < 3; j++) { // try several times because sometimes 2Captcha could return an error
-            try {
-              logger.info('Sending the CAPTCHA to 2Captcha');
-              const payload: paramsCoordinates = {
-                body: (await challenge.screenshot({ timeout: 5000 })).toString('base64'),
-                lang: process.env.BROWSER_LOCALE
-              };
-              if (drag) {
-                // Say to the worker that he needs to click
-                payload.textinstructions = 'CLICK on the shapes at their edge or center as shown above—please be precise!';
-                payload.imginstructions = (await fs.readFile(path.join(process.cwd(), 'public', 'drag-instructions.jpg'))).toString('base64');
-              }
-              captcha = await this.solver.coordinates(payload);
-              break;
-            } catch(err: any) {
-              logger.info(err.message);
-              if (j != 2)
-                logger.info('Retrying...');
-              else
-                throw err;
-            }
-          } 
-          if (drag) {
-            const challengeBox = await challenge.boundingBox();
-            if (challengeBox == null)
-              throw new Error('.challenge-container boundingBox is null!');
-            if (captcha.data.length % 2) {
-              logger.info('Solution does not have even amount of points required for dragging. Requesting new solution...');
-              this.solver.badReport(captcha.id);
-              wait = false;
-              continue;
-            }
-            for (let i = 0; i < captcha.data.length; i += 2) {
-              const data1 = captcha.data[i];
-              const data2 = captcha.data[i+1];
-              logger.info(JSON.stringify(data1) + JSON.stringify(data2));
-              await page.mouse.move(challengeBox.x + +data1.x, challengeBox.y + +data1.y);
-              await page.mouse.down();
-              await sleep(1.1); // wait for the piece to be 'unlocked'
-              await page.mouse.move(challengeBox.x + +data2.x, challengeBox.y + +data2.y, { steps: 30 });
-              await page.mouse.up();
-            }
-            wait = true;
-          } else {
-            for (const data of captcha.data) {
-              logger.info(data);
-              await this.click(challenge, { x: +data.x, y: +data.y });
-            };
-          }
-          this.click(frame.locator('.button-submit')).catch(e => {
-            if (e.message.includes('viewport')) // when hCaptcha window has been closed due to inactivity,
-              this.click(button); // click the Create button again to trigger the CAPTCHA
-            else
-              throw e;
-          });
-        }
-      } catch(e: any) {
-        if (e.message.includes('been closed') // catch error when closing the browser
-          || e.message == 'AbortError') // catch error when waitForRequests is aborted
-          resolve();
-        else
-          reject(e);
-      }
-    }).catch(e => {
-      browser.browser()?.close();
-      throw e;
-    });
-    return (new Promise((resolve, reject) => {
-      page.route('**/api/generate/v2/**', async (route: any) => {
-        try {
-          logger.info('hCaptcha token received. Closing browser');
-          route.abort();
-          browser.browser()?.close();
-          controller.abort();
-          const request = route.request();
-          this.currentToken = request.headers().authorization.split('Bearer ').pop();
-          resolve(request.postDataJSON().token);
-        } catch(err) {
-          reject(err);
-        }
+      const res: any = await this.solver.hcaptcha({
+        pageurl: 'https://suno.com/create',
+        sitekey: process.env.HCAPTCHA_SITEKEY || 'd65453de-3f1a-4aac-9366-a0f06e52b2ce',
       });
-    }));
-  }
-
-  /**
-   * Imitates Cloudflare Turnstile loading error. Unused right now, left for future
-   */
-  private async getTurnstile() {
-    return this.client.post(
-      `https://clerk.suno.com/v1/client?__clerk_api_version=2021-02-05&_clerk_js_version=${SunoApi.CLERK_VERSION}&_method=PATCH`,
-      { captcha_error: '300030,300030,300030' },
-      { headers: { 'content-type': 'application/x-www-form-urlencoded' } });
+      const token = res?.data || res?.token;
+      if (!token) throw new Error('2captcha returned empty hCaptcha token');
+      logger.info({ tokenLen: token.length }, 'hCaptcha token received');
+      return token;
+    } catch (err: any) {
+      await dumpHttpFailure(err, { account: accountTag(this.cookies.__client), step: 'hcaptcha_2captcha' }).catch(() => {});
+      throw err;
+    }
   }
 
   /**
@@ -627,20 +415,30 @@ class SunoApi {
           2
         )
     );
-    const response = await this.client.post(
-      `${SunoApi.BASE_URL}/api/generate/v2-web/`,
-      payload,
-      {
-        timeout: 30000,
-        headers: {
-          // 网页端特有的 browser-token,内容仅为当前毫秒时间戳的 base64
-          'browser-token': JSON.stringify({ token: Buffer.from(JSON.stringify({ timestamp: Date.now() })).toString('base64') }),
-          'referring-pathname': '/'
+    let response;
+    try {
+      response = await this.client.post(
+        `${SunoApi.BASE_URL}/api/generate/v2-web/`,
+        payload,
+        {
+          timeout: 30000,
+          headers: {
+            // 网页端特有的 browser-token,内容仅为当前毫秒时间戳的 base64
+            'browser-token': JSON.stringify({ token: Buffer.from(JSON.stringify({ timestamp: Date.now() })).toString('base64') }),
+            'referring-pathname': '/'
+          }
         }
-      }
-    );
+      );
+    } catch (err: any) {
+      // axios 对非 2xx(含 422 token_validation_failed)/网络/超时统一 reject —— 落完整 response.data 再抛
+      await dumpHttpFailure(err, { account: accountTag(this.cookies.__client), step: 'generate_v2_web' }).catch(() => {});
+      throw err;
+    }
     if (response.status !== 200) {
-      throw new Error('Error response:' + response.statusText);
+      const err: any = new Error('Error response:' + response.statusText);
+      err.response = response;
+      await dumpHttpFailure(err, { account: accountTag(this.cookies.__client), step: 'generate_v2_web' }).catch(() => {});
+      throw err;
     }
     // 过滤试听版(preview):免费账号的 v5.5(fenix)为 60s 试听,无完整音频,只保留完整版(gen)
     const fullClips = response.data.clips.filter((audio: any) => audio.metadata?.type !== 'preview');

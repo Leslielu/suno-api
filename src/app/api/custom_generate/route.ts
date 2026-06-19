@@ -2,11 +2,12 @@ import { NextResponse, NextRequest } from "next/server";
 import { cookies } from 'next/headers';
 import { DEFAULT_MODEL, sunoApi, sunoApiFromRequest, pool, AllAccountsExhausted } from "@/lib/SunoApi";
 import { corsHeaders } from "@/lib/utils";
+import { withRequestLog } from "@/lib/requestLog";
 
 export const maxDuration = 60; // allow longer timeout for wait_audio == true
 export const dynamic = "force-dynamic";
 
-export async function POST(req: NextRequest) {
+async function handle(req: NextRequest) {
   if (req.method === 'POST') {
     try {
       const body = await req.json();
@@ -53,6 +54,8 @@ export async function POST(req: NextRequest) {
     });
   }
 }
+
+export const POST = withRequestLog('custom_generate', handle);
 
 export async function OPTIONS(request: Request) {
   return new Response(null, {
