@@ -22,10 +22,13 @@ description: suno-api 项目的验证码(hCaptcha)排查与修复。当 generate
 ```ts
 const res = await this.solver.hcaptcha({
   pageurl: 'https://suno.com/create',
-  sitekey: process.env.HCAPTCHA_SITEKEY || 'd65453de-3f1a-4aac-9366-a0f06e52b2ce',
+  sitekey: ...,
+  userAgent: this.userAgent,   // ⚠️ 必传!且要与访问 Suno 的 UA 一致
 });
-return res.data || res.token;   // ~18-35s 拿到 token,塞进 generateSongs 的 payload.token
+return res.data || res.token;   // 塞进 generateSongs 的 payload.token
 ```
+
+**⚠️ userAgent 是关键(2026-06-20 实测)**:不传 userAgent 时 2captcha worker 用不匹配的 UA 解题,稳定报 `Your captcha was unable to be solved after 3 attempts`;传 `this.userAgent`(与 axios client 访问 Suno 的 UA 同源)后稳定解出。**rqdata 不是必需**——`/api/c/check` 只返回 `{required, captcha_version}`,不下发 rqdata(曾误判缺 rqdata,实测 `hasRqdata:false` 仍能解)。
 
 **禁止**恢复"浏览器 + coordinates 解题"方案:coordinates 解"比X更重"逻辑题**慢(实测 235s,3 次全错)+ 不准**,远超挑战 60s 有效期。
 
@@ -45,6 +48,7 @@ return res.data || res.token;   // ~18-35s 拿到 token,塞进 generateSongs 的
 | `token_validation_failed` 422 | generate/v2-web 没带有效 hCaptcha token | 确认 getCaptcha 返回了 token(solver.hcaptcha),generateSongs payload.token 有值 |
 | 选择器超时(`.custom-textarea` 等) | Suno 改版 create 页 DOM | token-based 方案不浏览器,不受影响。若恢复浏览器,用 dump 的 dom.html 找新选择器(注意 dpr=2,coordinates 要 /dpr) |
 | `solver.turnstile is not a function` | 用错接口/库版本旧 | hCaptcha 用 `solver.hcaptcha({pageurl, sitekey})`,参数是 **pageurl** 不是 url |
+| `unable to be solved after 3 attempts`(2captcha APIError) | `solver.hcaptcha` 没传 `userAgent`(2026-06-20) | 必传 `userAgent: this.userAgent`(与访问 Suno 的 UA 一致)。**不是 rqdata/sitekey 问题**——单测 `test-hcaptcha.mjs` 也报此错时,先确认 getCaptcha 传了 userAgent;`/api/c/check` 不下发 rqdata |
 
 ## 工具脚本
 

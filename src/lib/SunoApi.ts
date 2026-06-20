@@ -209,21 +209,28 @@ class SunoApi {
    * @returns {string|null} hCaptcha token. If no verification is required, returns null
    */
   public async getCaptcha(): Promise<string|null> {
-    if (!await this.captchaRequired())
-      return null;
+    // 调 Suno captcha check 接口确认是否需要验证 + 拿 sitekey/rqdata(若有)。
+    // 关键:必须给 solver.hcaptcha 传 userAgent,且要与访问 Suno 的 UA 一致 —— 不传时 2captcha worker
+    // 用不匹配的 UA 解题,实测 "unable to be solved after 3 attempts";传后稳定解出。
+    // (rqdata 可选兜底:当前 Suno /api/c/check 只返回 {required,captcha_version},不下发 rqdata)
+    const checkResp = await this.client.post(`${SunoApi.BASE_URL}/api/c/check`, { ctype: 'generation' });
+    const check: any = checkResp.data || {};
+    logger.info({ keys: Object.keys(check), check }, 'captcha /api/c/check');
+    if (!check.required) return null;
 
-    // Suno 用 hCaptcha(sitekey 见 create 页 challenge iframe 的 src)。直接用 2captcha 的
-    // hcaptcha 接口(token-based:pageurl + sitekey → token)拿 token,不再用浏览器 + coordinates
-    // 解题(coordinates 解"比X更重"这类逻辑题既慢又准,远超 60s 有效期)。
-    logger.info('Solving hCaptcha via 2captcha (token-based)...');
+    const rqdata: string | null = check.rqdata || null;
+    const sitekey = check.sitekey || process.env.HCAPTCHA_SITEKEY || 'd65453de-3f1a-4aac-9366-a0f06e52b2ce';
+    logger.info({ hasRqdata: !!rqdata, sitekey, ua: this.userAgent }, 'Solving hCaptcha via 2captcha');
     try {
       const res: any = await this.solver.hcaptcha({
         pageurl: 'https://suno.com/create',
-        sitekey: process.env.HCAPTCHA_SITEKEY || 'd65453de-3f1a-4aac-9366-a0f06e52b2ce',
+        sitekey,
+        userAgent: this.userAgent,
+        ...(rqdata ? { data: rqdata } : {}),
       });
       const token = res?.data || res?.token;
       if (!token) throw new Error('2captcha returned empty hCaptcha token');
-      logger.info({ tokenLen: token.length }, 'hCaptcha token received');
+      logger.info({ tokenLen: token.length, hadRqdata: !!rqdata }, 'hCaptcha token received');
       return token;
     } catch (err: any) {
       await dumpHttpFailure(err, { account: accountTag(this.cookies.__client), step: 'hcaptcha_2captcha' }).catch(() => {});
