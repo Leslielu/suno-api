@@ -220,22 +220,31 @@ class SunoApi {
 
     const rqdata: string | null = check.rqdata || null;
     const sitekey = check.sitekey || process.env.HCAPTCHA_SITEKEY || 'd65453de-3f1a-4aac-9366-a0f06e52b2ce';
-    logger.info({ hasRqdata: !!rqdata, sitekey, ua: this.userAgent }, 'Solving hCaptcha via 2captcha');
-    try {
-      const res: any = await this.solver.hcaptcha({
-        pageurl: 'https://suno.com/create',
-        sitekey,
-        userAgent: this.userAgent,
-        ...(rqdata ? { data: rqdata } : {}),
-      });
-      const token = res?.data || res?.token;
-      if (!token) throw new Error('2captcha returned empty hCaptcha token');
-      logger.info({ tokenLen: token.length, hadRqdata: !!rqdata }, 'hCaptcha token received');
-      return token;
-    } catch (err: any) {
-      await dumpHttpFailure(err, { account: accountTag(this.cookies.__client), step: 'hcaptcha_2captcha' }).catch(() => {});
-      throw err;
+    // 2captcha 解 hCaptcha 偶发失败("unable to be solved after 3 attempts",worker 没解出逻辑题),
+    // 重试 1 次(共 2 次尝试)通常能恢复。单次最坏 ~95s,2 次最坏 ~190s。
+    const maxAttempts = 2;
+    let lastErr: any = null;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      logger.info({ attempt, maxAttempts, hasRqdata: !!rqdata, sitekey, ua: this.userAgent }, 'Solving hCaptcha via 2captcha');
+      try {
+        const res: any = await this.solver.hcaptcha({
+          pageurl: 'https://suno.com/create',
+          sitekey,
+          userAgent: this.userAgent,
+          ...(rqdata ? { data: rqdata } : {}),
+        });
+        const token = res?.data || res?.token;
+        if (!token) throw new Error('2captcha returned empty hCaptcha token');
+        logger.info({ attempt, tokenLen: token.length, hadRqdata: !!rqdata }, 'hCaptcha token received');
+        return token;
+      } catch (err: any) {
+        lastErr = err;
+        logger.warn({ attempt, maxAttempts, err: err?.message }, 'hCaptcha solve attempt failed');
+      }
     }
+    // 所有尝试都失败才 dump 现场 + 抛出(中间失败只 warn,继续重试)
+    await dumpHttpFailure(lastErr, { account: accountTag(this.cookies.__client), step: 'hcaptcha_2captcha' }).catch(() => {});
+    throw lastErr;
   }
 
   /**
